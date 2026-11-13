@@ -144,24 +144,31 @@
   }
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  // Geni allows about one request per 10 s, apparently per person across all their apps. When it
+  // refuses (a rate-limited JSONP reply fails to load) we back off further each time and keep going.
   async function api(path, params = {}) {
-    for (let attempt = 0; attempt < 6; attempt++) {
+    for (let fails = 0; ; ) {
+      while (geni.paused) await sleep(1000);
       const wait = geni.nextAt - Date.now();
       if (wait > 0) await sleep(wait);
+      if (!geni.token) { const e = new Error("signed out"); e.auth = true; throw e; }
       geni.nextAt = Date.now() + GENI_GAP_MS;
-      let data;
-      try {
-        data = await jsonp(path, params);
-      } catch {
-        geni.nextAt = Date.now() + GENI_GAP_MS * 1.5;
-        continue;
-      }
+      let data = null;
+      try { data = await jsonp(path, params); } catch { /* busy or offline */ }
       const msg = (data && (data.error?.message || (!data.id && !data.relations && !data.status && data.message))) || "";
-      if (/rate limit/i.test(msg)) { geni.nextAt = Date.now() + GENI_GAP_MS * 1.2; continue; }
-      if (/token|oauth|authoriz/i.test(msg)) { const e = new Error(msg); e.auth = true; throw e; }
-      return data;
+      if (data && /token|oauth|authoriz/i.test(msg)) { const e = new Error(msg); e.auth = true; throw e; }
+      if (data && !/rate limit/i.test(msg)) {
+        if (geni.notice) { geni.notice = ""; render(); }
+        return data;
+      }
+      fails += 1;
+      const backoff = Math.min(120000, GENI_GAP_MS * 2 ** Math.min(fails, 4));
+      geni.nextAt = Date.now() + backoff;
+      geni.notice = navigator.onLine === false
+        ? "You're offline. Waiting for a connection…"
+        : `Geni asked us to slow down. Trying again in ${Math.round(backoff / 1000)} s.`;
+      render();
     }
-    throw new Error("Geni didn't answer after several tries.");
   }
 
   async function pathTo(g, extra) {
@@ -195,7 +202,8 @@
     if (main.status !== "done") return { status: "done", kind: "none", relationship: "", chain: [], at: Date.now() };
     if (also && also.relationship === main.relationship) also = null;
     return { status: "done", kind: classify(main), relationship: main.relationship, steps: main.steps, chain: main.chain,
-             also: also && { relationship: also.relationship, chain: also.chain }, at: Date.now() };
+             also: also && { relationship: also.relationship, chain: also.chain, steps: also.steps, kind: classify(also) },
+             at: Date.now() };
   }
 
   function saveRels() {
@@ -209,6 +217,24 @@
     } catch { geni.rels = {}; }
   }
 
+  // Only one Plotline tab per browser asks Geni at a time; others pick up its results.
+  const TAB = Math.random().toString(36).slice(2);
+  function takeLock() {
+    try {
+      const l = JSON.parse(store.get("geniLock", "null"));
+      if (l && l.tab !== TAB && Date.now() - l.at < 25000) return false;
+    } catch { /* take it */ }
+    store.set("geniLock", JSON.stringify({ tab: TAB, at: Date.now() }));
+    return true;
+  }
+  function dropLock() {
+    try { if (JSON.parse(store.get("geniLock", "null"))?.tab === TAB) store.del("geniLock"); } catch { /* ignore */ }
+  }
+  window.addEventListener("pagehide", dropLock);
+  window.addEventListener("storage", (e) => {
+    if (geni.user && e.key === `rels:${geni.user.id}`) { loadRels(); drawGraves(); render(); }
+  });
+
   function nextGrave() {
     const now = Date.now();
     const open = state.graves.filter((g) => {
@@ -216,6 +242,8 @@
       return !r || (r.status === "pending" && r.tries < 5 && r.retryAt <= now);
     });
     if (!open.length) return null;
+    const first = open.find((g) => g.id === geni.priority);
+    if (first) { geni.priority = null; return first; }
     const here = state.me || state.section?.centre;
     return open.reduce((best, g) => (dist(here, g.gps) < dist(here, best.gps) ? g : best));
   }
@@ -244,9 +272,22 @@
   async function work() {
     if (geni.busy && geni.working) return;
     geni.working = geni.busy = true;
+    geni.error = "";
     render();
+    const heartbeat = setInterval(() => {
+      try { if (JSON.parse(store.get("geniLock", "null"))?.tab === TAB) store.set("geniLock", JSON.stringify({ tab: TAB, at: Date.now() })); } catch { /* ignore */ }
+    }, 5000);
     try {
       while (geni.token && geni.user && !geni.paused) {
+        if (!takeLock()) {
+          geni.notice = "Another Plotline tab or window in this browser is asking Geni. Its results show up here too.";
+          render();
+          await sleep(5000);
+          loadRels();
+          drawGraves();
+          if (state.graves.every((x) => relOf(x)?.status === "done")) break;
+          continue;
+        }
         const g = nextGrave();
         if (!g) {
           const waiting = state.graves.some((x) => relOf(x)?.status === "pending" && relOf(x).tries < 5);
@@ -265,11 +306,19 @@
         render();
       }
     } catch (e) {
-      if (e.auth) { geni.working = geni.busy = false; signOut(); toast("Your Geni sign-in has expired. Please sign in again."); return; }
+      if (e.auth) {
+        clearInterval(heartbeat); dropLock();
+        geni.working = geni.busy = false;
+        if (geni.token) { signOut(); toast("Your Geni sign-in has expired. Please sign in again."); }
+        return;
+      }
       if (geni.user) geni.error = e.message;
     }
+    clearInterval(heartbeat);
     geni.current = null;
+    geni.notice = "";
     geni.working = geni.busy = false;
+    dropLock();
     render();
   }
 
@@ -433,7 +482,7 @@
     const cur = state.graves.find((g) => g.id === geni.current);
     return `<div class="signin progress">
       <div><b>Working out your relationships · ${done} of ${total}</b>
-        <span class="muted">${geni.paused ? "Paused." : geni.error ? esc(geni.error) : `Nearest first. About ${mins} min left${cur ? ` · asking about ${esc(cur.name)}` : ""}.`}</span>
+        <span class="muted">${geni.paused ? "Paused." : geni.notice ? esc(geni.notice) : geni.error ? esc(geni.error) : `Nearest first. About ${mins} min left${cur ? ` · asking about ${esc(cur.name)}` : ""}.`}</span>
         <div class="bar-track"><div class="bar-fill" style="width:${Math.round((done / total) * 100)}%"></div></div></div>
       <button type="button" class="btn secondary" data-act="${geni.paused ? "resume" : "pause"}">${geni.paused ? "Resume" : "Pause"}</button></div>`;
   }
@@ -527,8 +576,12 @@
         ${plot ? `<dt>Plot</dt><dd>${esc(plot)}</dd>` : ""}
         ${g.lotmates.length ? `<dt>Same lot</dt><dd>${g.lotmates.map(esc).join(", ")}</dd>` : ""}
       </dl>
+      ${r?.also ? `<div class="also-line">${swatch(r.also.kind || "blood")}<span>Also your <b>${esc(r.also.relationship)}</b>
+        <span class="muted">· ${esc(KINDS[r.also.kind || "blood"].label.toLowerCase())}${r.also.steps ? `, ${r.also.steps} steps` : ""}</span></span></div>` : ""}
       ${steps ? `<h3>How you're connected · ${steps} step${steps > 1 ? "s" : ""}</h3>${chainHtml(r.chain, g)}` : ""}
-      ${r?.also ? `<details class="also"><summary>Also: your ${esc(r.also.relationship)}</summary>${chainHtml(r.also.chain, g)}</details>` : ""}
+      ${r?.also ? `<details class="also"><summary>Show the ${esc(KINDS[r.also.kind || "blood"].label.toLowerCase())} path</summary>${chainHtml(r.also.chain, g)}</details>` : ""}
+      ${steps && r?.also ? `<p class="muted note">Plotline shows the shorter connection first, and a blood line first unless it's more than two steps longer.</p>` : ""}
+      ${geni.user && r?.status === "done" ? `<button type="button" class="linkish recheck" data-act="recheck" data-gid="${esc(g.id)}">Ask Geni again</button>` : ""}
       <div class="links">
         <a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${g.gps[0]},${g.gps[1]}&travelmode=walking" target="_blank" rel="noopener">Walking directions</a>
         ${g.geni ? `<a class="btn secondary" href="${esc(g.geni)}" target="_blank" rel="noopener">Geni profile</a>` : ""}
@@ -569,6 +622,16 @@
     if (act === "signout") return signOut();
     if (act === "pause") { geni.paused = true; return render(); }
     if (act === "resume") { geni.paused = false; geni.error = ""; return work(); }
+    if (act === "recheck") {
+      delete geni.rels[t.dataset.gid];
+      saveRels();
+      geni.priority = t.dataset.gid;
+      geni.paused = false;
+      drawGraves();
+      render();
+      toast("Asking Geni again. It's next in line.");
+      return work();
+    }
     if (act === "jump") {
       setMode("explore");
       setMe(move(state.section.centre, -18, 0), { pan: true, zoom: 19.5 });
