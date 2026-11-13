@@ -70,8 +70,22 @@
   /* ---------- Geni: sign-in ---------- */
   const redirectUri = () => location.origin + location.pathname;
 
+  // Geni may send the token as "#access_token=..." or percent-encoded as "#access_token%3D...%26...",
+  // and possibly in the query string; accept any of them.
+  function signInParams() {
+    for (let raw of [location.hash.slice(1), location.search.slice(1)]) {
+      if (!raw) continue;
+      if (!raw.includes("=") || /access_token%3D|status%3D/i.test(raw)) {
+        try { raw = decodeURIComponent(raw); } catch { /* keep as is */ }
+      }
+      const p = new URLSearchParams(raw.replace(/^[#?]/, ""));
+      if (p.get("access_token") || p.get("status")) return p;
+    }
+    return new URLSearchParams();
+  }
+
   function readSignIn() {
-    const h = new URLSearchParams(location.hash.slice(1));
+    const h = signInParams();
     if (h.get("access_token")) {
       geni.token = h.get("access_token");
       geni.expires = Date.now() + (Number(h.get("expires_in")) || 86400) * 1000 - 60000;
