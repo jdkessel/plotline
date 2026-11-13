@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Kin in the Rows</title>
+<meta name="description" content="Walk a cemetery section and see who is buried around you and how they're related.">
+<meta name="theme-color" content="#4d6b3c">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Marcellus&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='9' y='4' width='14' height='24' rx='7' fill='%234d6b3c'/%3E%3Crect x='15' y='9' width='2' height='11' fill='%23fff'/%3E%3Crect x='12' y='12' width='8' height='2' fill='%23fff'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <div>
+      <h1>Kin in the Rows</h1>
+      <select id="section" aria-label="Cemetery section"></select>
+    </div>
+  </div>
+  <div class="controls">
+    <div class="seg" role="group" aria-label="Where you are">
+      <button id="modeExplore" class="on" type="button">Explore</button>
+      <button id="modeLive" type="button"><span class="wide">My location</span><span class="narrow">GPS</span></button>
+    </div>
+    <button id="units" class="ghost" type="button" title="Switch feet / metres">ft</button>
+  </div>
+</header>
+
+<main class="layout">
+  <div class="mapwrap">
+    <div id="map" aria-label="Map of the section"></div>
+    <div id="hint" class="hint">Tap the map to stand there · drag the dot · arrow keys walk</div>
+    <div id="dpad" class="dpad" aria-label="Walk">
+      <button data-step="n" aria-label="Walk north">▲</button>
+      <button data-step="w" aria-label="Walk west">◀</button>
+      <button data-step="c" class="c" aria-label="Centre on me">◎</button>
+      <button data-step="e" aria-label="Walk east">▶</button>
+      <button data-step="s" aria-label="Walk south">▼</button>
+    </div>
+  </div>
+  <aside id="panel" class="panel">
+    <button id="handle" class="handle" type="button" aria-label="Expand list"><span></span></button>
+    <div id="panelBody" class="panel-body"><p class="muted pad">Loading…</p></div>
+  </aside>
+</main>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
