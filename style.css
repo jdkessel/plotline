@@ -1,7 +1,7 @@
 :root {
   --bg: #efeadf; --panel: #fbf8f1; --raised: #ffffff; --ink: #22261f; --muted: #6b6e63;
   --line: #ddd6c6; --moss: #4d6b3c; --moss-ink: #ffffff; --bronze: #8d6129;
-  --direct: #c8462f; --blood: #d99a22; --inlaw: #2a9d8a; --none: #8f86a6;
+  --direct: #c8462f; --blood: #d99a22; --inlaw: #2a9d8a; --none: #8f86a6; --unknown: #a6aaa0;
   --shadow: 0 1px 2px rgba(30, 28, 20, .08), 0 6px 24px rgba(30, 28, 20, .10);
   color-scheme: light;
 }
@@ -9,7 +9,7 @@
   :root:not([data-theme="light"]) {
     --bg: #131512; --panel: #1b1e19; --raised: #242821; --ink: #ece8dd; --muted: #a3a597;
     --line: #343830; --moss: #8fb06f; --moss-ink: #131512; --bronze: #d3a160;
-    --direct: #ef6a50; --blood: #f0b545; --inlaw: #45c4ae; --none: #b0a8c6;
+    --direct: #ef6a50; --blood: #f0b545; --inlaw: #45c4ae; --none: #b0a8c6; --unknown: #7d8278;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 8px 28px rgba(0, 0, 0, .45);
     color-scheme: dark;
   }
@@ -17,7 +17,7 @@
 :root[data-theme="dark"] {
   --bg: #131512; --panel: #1b1e19; --raised: #242821; --ink: #ece8dd; --muted: #a3a597;
   --line: #343830; --moss: #8fb06f; --moss-ink: #131512; --bronze: #d3a160;
-  --direct: #ef6a50; --blood: #f0b545; --inlaw: #45c4ae; --none: #b0a8c6;
+  --direct: #ef6a50; --blood: #f0b545; --inlaw: #45c4ae; --none: #b0a8c6; --unknown: #7d8278;
   color-scheme: dark;
 }
 
@@ -211,3 +211,16 @@ h3 { font: 600 12px "IBM Plex Sans", sans-serif; text-transform: uppercase; lett
 .links a { text-decoration: none; }
 details.also summary { cursor: pointer; color: var(--moss); font-size: 14px; margin-top: 14px; }
 .foot { padding: 16px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); }
+.linkish { border: 0; background: none; padding: 0; color: var(--moss); cursor: pointer; font-size: 12px; text-decoration: underline; }
+.signin {
+  display: flex; align-items: center; gap: 12px; margin: 12px 16px 0; padding: 12px 14px; border-radius: 12px;
+  background: var(--raised); border: 1px solid var(--line); font-size: 14px; line-height: 1.4;
+}
+.signin > div { flex: 1; }
+.signin .btn { margin: 0; flex: none; }
+.signin.small { margin: 12px 0 0; }
+.signin .muted { font-size: 13px; }
+.btn[disabled] { opacity: .45; cursor: not-allowed; }
+.bar-track { height: 4px; border-radius: 2px; background: var(--line); margin-top: 8px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--moss); transition: width .4s; }
+.rel.pending { font-style: italic; }

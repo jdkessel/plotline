@@ -1,21 +1,28 @@
-/* Kin in the Rows: walk a cemetery section and see who is around you. */
+/* Plotline: walk a cemetery section and see who is around you.
+   Graves are public data; relationships are worked out live for whoever signs in with Geni,
+   from their own account, in their own browser. */
 (() => {
   "use strict";
 
+  const CONFIG = window.KIN_CONFIG || {};
   const KINDS = {
     direct: { label: "Direct line", css: "--direct" },
     blood: { label: "Blood relative", css: "--blood" },
     inlaw: { label: "Through marriage", css: "--inlaw" },
-    none: { label: "Not connected yet", css: "--none" },
+    none: { label: "Not connected", css: "--none" },
+    unknown: { label: "Not worked out yet", css: "--unknown" },
   };
   const STEP_M = 1.5;          // one arrow-key step
   const FAR_M = 600;           // further than this from the section = "not here"
   const LABEL_ZOOM = 20;       // show names on the map from this zoom
+  const GENI_GAP_MS = 10500;   // Geni allows about one request per 10 s
+  const CACHE_DAYS = 30;
 
   const $ = (s) => document.querySelector(s);
   const store = {
     get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
     set(k, v) { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
+    del(k) { try { localStorage.removeItem(k); } catch { /* private mode */ } },
   };
   const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -39,9 +46,11 @@
   const state = {
     sections: [], section: null, graves: [], me: null, mode: "explore", heading: null,
     radius: Number(store.get("radius", "30")), units: store.get("units", "ft"),
-    kinds: new Set(JSON.parse(store.get("kinds", '["direct","blood","inlaw","none"]'))),
+    hidden: new Set(JSON.parse(store.get("hiddenKinds", "[]"))),
     selected: null, follow: true, watchId: null, lastFix: null,
   };
+  // Geni sign-in and this visitor's relationships (kept only in this browser).
+  const geni = { token: null, expires: 0, user: null, rels: {}, busy: false, paused: false, nextAt: 0, error: "" };
 
   function fmt(m) {
     if (state.units === "ft") {
@@ -51,6 +60,204 @@
     return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
   }
   const radiusLabel = (r) => (state.units === "ft" ? `${Math.round(r * 3.28084 / 5) * 5} ft` : `${r} m`);
+  const relOf = (g) => geni.rels[g.id];
+  const kindOf = (g) => {
+    const r = relOf(g);
+    if (!r || r.status === "pending") return "unknown";
+    return r.kind;
+  };
+
+  /* ---------- Geni: sign-in ---------- */
+  const redirectUri = () => location.origin + location.pathname;
+
+  function readSignIn() {
+    const h = new URLSearchParams(location.hash.slice(1));
+    if (h.get("access_token")) {
+      geni.token = h.get("access_token");
+      geni.expires = Date.now() + (Number(h.get("expires_in")) || 86400) * 1000 - 60000;
+      store.set("geniToken", JSON.stringify({ token: geni.token, expires: geni.expires }));
+      history.replaceState(null, "", location.pathname + store.get("returnHash", ""));
+      store.del("returnHash");
+      return "new";
+    }
+    if (h.get("status") === "unauthorized") {
+      history.replaceState(null, "", location.pathname + store.get("returnHash", ""));
+      store.del("returnHash");
+      return "declined";
+    }
+    try {
+      const saved = JSON.parse(store.get("geniToken", "null"));
+      if (saved && saved.expires > Date.now()) Object.assign(geni, saved);
+    } catch { /* ignore */ }
+    return geni.token ? "saved" : "none";
+  }
+
+  function signIn() {
+    if (!CONFIG.geniAppKey) return toast("Geni sign-in isn't set up for this site yet.");
+    store.set("returnHash", location.hash);
+    const q = new URLSearchParams({ client_id: CONFIG.geniAppKey, redirect_uri: redirectUri(), response_type: "token", display: "web" });
+    location.href = `https://www.geni.com/platform/oauth/authorize?${q}`;
+  }
+
+  function signOut() {
+    store.del("geniToken");
+    if (geni.user) store.del(`rels:${geni.user.id}`);
+    Object.assign(geni, { token: null, expires: 0, user: null, rels: {}, error: "" });
+    drawGraves();
+    render();
+    toast("Signed out. Your relationships were cleared from this browser.");
+  }
+
+  /* ---------- Geni: API calls (JSONP, which Geni supports for other websites) ---------- */
+  let seq = 0;
+  function jsonp(path, params) {
+    return new Promise((resolve, reject) => {
+      const name = `__kin${Date.now().toString(36)}${++seq}`;
+      const script = document.createElement("script");
+      const timer = setTimeout(() => finish(new Error("timeout")), 30000);
+      function finish(err, data) {
+        clearTimeout(timer);
+        window[name] = () => {};   // a late reply must not throw
+        script.remove();
+        err ? reject(err) : resolve(data);
+      }
+      window[name] = (data) => finish(null, data);
+      script.onerror = () => finish(new Error("network"));
+      const q = new URLSearchParams({ ...params, access_token: geni.token, callback: name });
+      script.src = `https://www.geni.com/api/${path}?${q}`;
+      document.head.appendChild(script);
+    });
+  }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function api(path, params = {}) {
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const wait = geni.nextAt - Date.now();
+      if (wait > 0) await sleep(wait);
+      geni.nextAt = Date.now() + GENI_GAP_MS;
+      let data;
+      try {
+        data = await jsonp(path, params);
+      } catch {
+        geni.nextAt = Date.now() + GENI_GAP_MS * 1.5;
+        continue;
+      }
+      const msg = (data && (data.error?.message || (!data.id && !data.relations && !data.status && data.message))) || "";
+      if (/rate limit/i.test(msg)) { geni.nextAt = Date.now() + GENI_GAP_MS * 1.2; continue; }
+      if (/token|oauth|authoriz/i.test(msg)) { const e = new Error(msg); e.auth = true; throw e; }
+      return data;
+    }
+    throw new Error("Geni didn't answer after several tries.");
+  }
+
+  async function pathTo(g, extra) {
+    const r = await api(`${geni.user.id}/path-to/${g.id}`, { skip_email: "true", skip_notify: "true", ...extra });
+    if (r.status !== "done" || !r.relations?.length) return { status: r.status || "not found" };
+    const chain = r.relations.map((x) => ({ name: x.name || "", relation: x.relation || "" }));
+    return { status: "done", relationship: r.relationship || "", steps: r.step_count || chain.length - 1, inlaw: !!r.inlaw_distance, chain };
+  }
+
+  function classify(p) {
+    const rels = p.chain.slice(1).map((c) => c.relation);
+    if (rels.length && rels.every((r) => r === "father" || r === "mother")) return "direct";
+    return p.inlaw ? "inlaw" : "blood";
+  }
+
+  // Geni's default path can be a roundabout in-law route even when a blood line exists, so an
+  // in-law answer is checked against the blood-only path; the shorter-ish one leads.
+  async function resolve(g) {
+    if (g.id === geni.user.id) return { status: "done", kind: "direct", relationship: "you", chain: [], at: Date.now() };
+    const closest = await pathTo(g, {});
+    if (closest.status === "pending") return { status: "pending", tries: (relOf(g)?.tries || 0) + 1, retryAt: Date.now() + 25000 };
+    let main = closest, also = null;
+    if (closest.status !== "done" || closest.inlaw) {
+      const blood = await pathTo(g, { path_type: "blood" });
+      if (blood.status === "done" && (closest.status !== "done" || blood.steps <= closest.steps + 2)) {
+        main = blood; also = closest.status === "done" ? closest : null;
+      } else if (blood.status === "done") {
+        also = blood;
+      }
+    }
+    if (main.status !== "done") return { status: "done", kind: "none", relationship: "", chain: [], at: Date.now() };
+    if (also && also.relationship === main.relationship) also = null;
+    return { status: "done", kind: classify(main), relationship: main.relationship, steps: main.steps, chain: main.chain,
+             also: also && { relationship: also.relationship, chain: also.chain }, at: Date.now() };
+  }
+
+  function saveRels() {
+    if (geni.user) store.set(`rels:${geni.user.id}`, JSON.stringify(geni.rels));
+  }
+  function loadRels() {
+    try {
+      const all = JSON.parse(store.get(`rels:${geni.user.id}`, "{}"));
+      const fresh = Date.now() - CACHE_DAYS * 864e5;
+      geni.rels = Object.fromEntries(Object.entries(all).filter(([, r]) => r.status === "done" && r.at > fresh));
+    } catch { geni.rels = {}; }
+  }
+
+  function nextGrave() {
+    const now = Date.now();
+    const open = state.graves.filter((g) => {
+      const r = relOf(g);
+      return !r || (r.status === "pending" && r.tries < 5 && r.retryAt <= now);
+    });
+    if (!open.length) return null;
+    const here = state.me || state.section?.centre;
+    return open.reduce((best, g) => (dist(here, g.gps) < dist(here, best.gps) ? g : best));
+  }
+
+  async function startGeni(kind) {
+    if (!geni.token) return render();
+    try {
+      if (!geni.user) {
+        geni.busy = true;
+        render();
+        const u = await api("profile", { fields: "id,name" });
+        if (!u.id) throw new Error("Geni didn't return your profile.");
+        geni.user = { id: u.id, name: u.name || "you" };
+        loadRels();
+        if (kind === "new") toast(`Signed in as ${geni.user.name}.`);
+      }
+      drawGraves();
+      work();
+    } catch (e) {
+      geni.busy = false;
+      if (e.auth) { signOut(); toast("Your Geni sign-in has expired. Please sign in again."); }
+      else { geni.error = e.message; render(); }
+    }
+  }
+
+  async function work() {
+    if (geni.busy && geni.working) return;
+    geni.working = geni.busy = true;
+    render();
+    try {
+      while (geni.token && geni.user && !geni.paused) {
+        const g = nextGrave();
+        if (!g) {
+          const waiting = state.graves.some((x) => relOf(x)?.status === "pending" && relOf(x).tries < 5);
+          if (!waiting) break;
+          await sleep(3000);
+          continue;
+        }
+        geni.current = g.id;
+        render();
+        const user = geni.user;
+        const rel = await resolve(g);
+        if (geni.user !== user) break;   // signed out (or switched) while Geni was answering
+        geni.rels[g.id] = rel;
+        saveRels();
+        drawGraves();
+        render();
+      }
+    } catch (e) {
+      if (e.auth) { geni.working = geni.busy = false; signOut(); toast("Your Geni sign-in has expired. Please sign in again."); return; }
+      if (geni.user) geni.error = e.message;
+    }
+    geni.current = null;
+    geni.working = geni.busy = false;
+    render();
+  }
 
   /* ---------- map ---------- */
   const map = L.map("map", { zoomControl: false, maxZoom: 22, zoomSnap: 0.5 }).setView([41.8649, -87.9125], 19);
@@ -90,6 +297,8 @@
   }
 
   async function init() {
+    const signIn = readSignIn();
+    if (signIn === "declined") toast("Geni sign-in was cancelled.");
     try {
       state.sections = await getJSON("data/sections.json");
     } catch (e) {
@@ -98,13 +307,13 @@
     }
     const sel = $("#section");
     sel.innerHTML = state.sections.map((s) => `<option value="${esc(s.id)}">${esc(s.cemetery)} · ${esc(s.short)}</option>`).join("");
-    sel.hidden = state.sections.length < 1;
     const hash = readHash();
     const first = state.sections.find((s) => s.id === hash.s) || state.sections[0];
     sel.value = first.id;
     sel.addEventListener("change", () => loadSection(sel.value, null));
     await loadSection(first.id, hash.at);
     if (hash.z) map.setZoom(hash.z);
+    startGeni(signIn);
   }
 
   async function loadSection(id, at) {
@@ -134,6 +343,7 @@
     const centre = data.centre || state.graves[0]?.gps;
     if (state.mode === "explore" || !state.me) setMe(at || move(centre, -18, 0), { pan: true, zoom: 19.5 });
     else render();
+    if (geni.user) work();
   }
 
   /* ---------- drawing ---------- */
@@ -141,11 +351,12 @@
     graveLayer.clearLayers();
     const labels = map.getZoom() >= LABEL_ZOOM;
     state.graves.forEach((g) => {
-      const on = state.kinds.has(g.connection);
-      const colour = cssVar(KINDS[g.connection].css);
+      const k = kindOf(g);
+      const on = !state.hidden.has(k);
+      const sel = state.selected === g;
       const m = L.circleMarker(g.pos, {
-        radius: state.selected === g ? 11 : 8, color: state.selected === g ? "#2f7df6" : "#ffffff",
-        weight: state.selected === g ? 3.5 : 2, fillColor: colour, fillOpacity: on ? 1 : 0.25, opacity: on ? 1 : 0.4,
+        radius: sel ? 11 : 8, color: sel ? "#2f7df6" : "#ffffff", weight: sel ? 3.5 : 2,
+        fillColor: cssVar(KINDS[k].css), fillOpacity: on ? 1 : 0.25, opacity: on ? 1 : 0.4,
       });
       m.bindTooltip(esc(g.name), { className: "name", direction: "top", offset: [0, -8], permanent: labels && on });
       m.on("click", (e) => { L.DomEvent.stopPropagation(e); select(g); });
@@ -184,7 +395,7 @@
 
   /* ---------- panel ---------- */
   const arrowSvg = (deg) => `<svg class="arrow" viewBox="0 0 16 16" style="transform:rotate(${deg}deg)" aria-hidden="true"><path d="M8 1l5 13-5-3-5 3z" fill="currentColor"/></svg>`;
-  const kindChip = (k) => `<span class="sw" style="background:var(${KINDS[k].css})"></span>`;
+  const swatch = (k) => `<span class="sw" style="background:var(${KINDS[k].css})"></span>`;
 
   function render() {
     if (!state.section || !state.me) return;
@@ -193,17 +404,35 @@
     renderList();
   }
 
+  function geniCard() {
+    if (!geni.token) {
+      return `<div class="signin">
+        <div><b>How are you related to them?</b><br><span class="muted">Sign in with your Geni account and this page asks Geni how you're connected to each person here. It all stays in your browser.</span></div>
+        <button type="button" class="btn" data-act="signin" ${CONFIG.geniAppKey ? "" : "disabled"}>Sign in with Geni</button></div>`;
+    }
+    if (!geni.user) return `<div class="signin"><span class="muted">${geni.error ? esc(geni.error) : "Connecting to Geni…"}</span></div>`;
+    const total = state.graves.length;
+    const done = state.graves.filter((g) => relOf(g)?.status === "done").length;
+    if (done >= total && !geni.busy) return "";
+    const left = total - done;
+    const mins = Math.max(1, Math.round((left * 1.4 * GENI_GAP_MS) / 60000));
+    const cur = state.graves.find((g) => g.id === geni.current);
+    return `<div class="signin progress">
+      <div><b>Working out your relationships · ${done} of ${total}</b>
+        <span class="muted">${geni.paused ? "Paused." : geni.error ? esc(geni.error) : `Nearest first. About ${mins} min left${cur ? ` · asking about ${esc(cur.name)}` : ""}.`}</span>
+        <div class="bar-track"><div class="bar-fill" style="width:${Math.round((done / total) * 100)}%"></div></div></div>
+      <button type="button" class="btn secondary" data-act="${geni.paused ? "resume" : "pause"}">${geni.paused ? "Resume" : "Pause"}</button></div>`;
+  }
+
   function renderList() {
     const me = state.me;
-    const all = state.graves
-      .map((g) => ({ g, d: dist(me, g.gps), b: bearing(me, g.gps) }))
-      .sort((a, b) => a.d - b.d);
-    const shown = all.filter((x) => state.kinds.has(x.g.connection));
+    const all = state.graves.map((g) => ({ g, k: kindOf(g), d: dist(me, g.gps), b: bearing(me, g.gps) })).sort((a, b) => a.d - b.d);
+    const shown = all.filter((x) => !state.hidden.has(x.k));
     const near = state.radius ? shown.filter((x) => x.d <= state.radius) : shown;
     const rest = state.radius ? shown.filter((x) => x.d > state.radius) : [];
     const sec = state.sections.find((s) => s.id === state.section.id) || {};
     const fromCentre = state.section.centre ? dist(me, state.section.centre) : 0;
-    const closestKin = all.find((x) => x.g.connection === "direct" || x.g.connection === "blood");
+    const closestKin = all.find((x) => x.k === "direct" || x.k === "blood");
 
     let html = "";
     if (fromCentre > FAR_M) {
@@ -211,28 +440,41 @@
         ${state.mode === "live" ? "Walk it virtually instead?" : ""}
         <br><button type="button" data-act="jump">${state.mode === "live" ? "Explore the section" : "Go to the section"}</button></div>`;
     }
+    html += geniCard();
     html += `<div class="head"><h2>${near.length ? `${near.length} around you` : "No one right here"}</h2>
       <p>${state.radius ? `within ${radiusLabel(state.radius)}` : "everyone in the section"}${closestKin && fromCentre <= FAR_M ? ` · closest kin: ${esc(closestKin.g.name)}, ${fmt(closestKin.d)} ${compass(closestKin.b)}` : ""}</p></div>`;
-    html += `<div class="tools">${Object.entries(KINDS).map(([k, v]) => {
-      const n = state.graves.filter((g) => g.connection === k).length;
-      return n ? `<button type="button" class="chip ${state.kinds.has(k) ? "on" : "off"}" data-kind="${k}" aria-pressed="${state.kinds.has(k)}">${kindChip(k)}${v.label} ${n}</button>` : "";
-    }).join("")}
+    const counts = {};
+    all.forEach((x) => { counts[x.k] = (counts[x.k] || 0) + 1; });
+    const chips = Object.keys(KINDS).filter((k) => counts[k]);
+    html += `<div class="tools">${chips.length > 1 ? chips.map((k) =>
+      `<button type="button" class="chip ${state.hidden.has(k) ? "off" : "on"}" data-kind="${k}" aria-pressed="${!state.hidden.has(k)}">${swatch(k)}${KINDS[k].label} ${counts[k]}</button>`).join("") : ""}
       <label class="radius">Range <select data-act="radius">${[10, 20, 30, 50, 100, 0].map((r) =>
         `<option value="${r}" ${r === state.radius ? "selected" : ""}>${r ? radiusLabel(r) : "All"}</option>`).join("")}</select></label></div>`;
     html += `<ul class="list">${near.map(row).join("")}</ul>`;
     if (rest.length) html += `<div class="sep">Further away</div><ul class="list">${rest.map(row).join("")}</ul>`;
     if (!shown.length) html += `<p class="pad muted">Nobody matches the filters above.</p>`;
-    html += `<div class="foot">Relationships from Geni. Grave locations from Catholic Cemeteries records. Living relatives are hidden.
-      <a href="${esc(state.section.geni_project)}" target="_blank" rel="noopener">Geni project</a></div>`;
+    html += `<div class="foot">Grave locations from Catholic Cemeteries records; people from the
+      <a href="${esc(state.section.geni_project)}" target="_blank" rel="noopener">Geni project</a>.
+      Not affiliated with Geni.${geni.user ? `<br>Signed in to Geni as ${esc(geni.user.name)} · <button type="button" class="linkish" data-act="signout">Sign out</button>` : ""}</div>`;
     $("#panelBody").innerHTML = html;
   }
 
-  function row({ g, d, b }) {
+  function relText(g) {
+    const r = relOf(g);
+    if (!geni.token) return "";
+    if (!r) return geni.current === g.id ? "Asking Geni…" : "Not worked out yet";
+    if (r.status === "pending") return "Geni is still working this out";
+    if (r.relationship === "you") return "You";
+    return r.relationship || "Not connected to you on Geni";
+  }
+
+  function row({ g, k, d, b }) {
     const yrs = [g.born, g.died].filter(Boolean).join("–");
+    const rel = relText(g);
     return `<li class="row" tabindex="0" data-id="${esc(g.id)}">
-      <span class="sw" style="background:var(${KINDS[g.connection].css})"></span>
+      ${swatch(k)}
       <div><div class="nm">${esc(g.name)}</div>
-        <div class="rel">${esc(g.relationship || "Not connected on Geni yet")}</div>
+        ${rel ? `<div class="rel ${relOf(g)?.status === "done" ? "" : "pending"}">${esc(rel)}</div>` : ""}
         ${yrs ? `<div class="yrs">${esc(yrs)}</div>` : ""}</div>
       <div class="dist">${arrowSvg(b)}${fmt(d)}<small>${compass(b)}</small></div></li>`;
   }
@@ -240,9 +482,8 @@
   function chainHtml(chain, g) {
     return `<ol class="chain">${chain.map((c, i) => {
       const cls = i === 0 ? "you" : i === chain.length - 1 ? "end" : "";
-      const hidden = c.name === "Living relative";
-      return `<li class="${cls}">${i ? `<span class="via">${esc(c.relation)}</span>` : ""}
-        <span class="who ${hidden ? "hidden" : ""}">${esc(i === chain.length - 1 ? g.name : c.name)}</span></li>`;
+      const name = i === 0 ? "You" : i === chain.length - 1 ? g.name : c.name;
+      return `<li class="${cls}">${i ? `<span class="via">${esc(c.relation)}</span>` : ""}<span class="who">${esc(name)}</span></li>`;
     }).join("")}</ol>`;
   }
 
@@ -250,20 +491,30 @@
     const d = dist(state.me, g.gps), b = bearing(state.me, g.gps);
     const plot = Object.entries(g.plot).filter(([, v]) => v).map(([k, v]) => `${k[0].toUpperCase() + k.slice(1)} ${v}`).join(", ");
     const yrs = [g.born, g.died].filter(Boolean).join("–");
-    const steps = g.chain.length ? g.chain.length - 1 : 0;
+    const r = relOf(g), k = kindOf(g);
+    const steps = r?.chain?.length ? r.chain.length - 1 : 0;
+    let relBlock;
+    if (!geni.token) {
+      relBlock = `<div class="signin small"><span class="muted">Sign in with Geni to see how you're related.</span>
+        <button type="button" class="btn" data-act="signin" ${CONFIG.geniAppKey ? "" : "disabled"}>Sign in with Geni</button></div>`;
+    } else if (r?.status === "done") {
+      relBlock = `<span class="tag" style="background:var(${KINDS[k].css})">${KINDS[k].label}</span>
+        <div class="big-rel">${r.relationship === "you" ? "This is you" : r.relationship ? `Your ${esc(r.relationship)}` : "Geni found no connection to you"}</div>`;
+    } else {
+      relBlock = `<div class="big-rel muted">${esc(relText(g))}</div>`;
+    }
     $("#panelBody").innerHTML = `<div class="detail">
       <button type="button" class="back" data-act="back">← Around you</button>
       <h2>${esc(g.name)}</h2>
       ${yrs ? `<div class="yrs">${esc(yrs)}</div>` : ""}
-      <span class="tag" style="background:var(${KINDS[g.connection].css})">${KINDS[g.connection].label}</span>
-      <div class="big-rel">${esc(g.relationship ? `Your ${g.relationship}` : "Not connected to your tree on Geni yet")}</div>
+      ${relBlock}
       <dl class="facts">
         <dt>From you</dt><dd>${arrowSvg(b)}<b>${fmt(d)}</b> ${compass(b)}</dd>
         ${plot ? `<dt>Plot</dt><dd>${esc(plot)}</dd>` : ""}
         ${g.lotmates.length ? `<dt>Same lot</dt><dd>${g.lotmates.map(esc).join(", ")}</dd>` : ""}
       </dl>
-      ${steps ? `<h3>How you're connected · ${steps} step${steps > 1 ? "s" : ""}</h3>${chainHtml(g.chain, g)}` : ""}
-      ${g.also ? `<details class="also"><summary>Also: your ${esc(g.also.relationship)}</summary>${chainHtml(g.also.chain, g)}</details>` : ""}
+      ${steps ? `<h3>How you're connected · ${steps} step${steps > 1 ? "s" : ""}</h3>${chainHtml(r.chain, g)}` : ""}
+      ${r?.also ? `<details class="also"><summary>Also: your ${esc(r.also.relationship)}</summary>${chainHtml(r.also.chain, g)}</details>` : ""}
       <div class="links">
         <a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${g.gps[0]},${g.gps[1]}&travelmode=walking" target="_blank" rel="noopener">Walking directions</a>
         ${g.geni ? `<a class="btn secondary" href="${esc(g.geni)}" target="_blank" rel="noopener">Geni profile</a>` : ""}
@@ -293,13 +544,18 @@
     if (t.dataset.id) return select(state.graves.find((g) => g.id === t.dataset.id));
     if (t.dataset.kind) {
       const k = t.dataset.kind;
-      state.kinds.has(k) ? state.kinds.delete(k) : state.kinds.add(k);
-      store.set("kinds", JSON.stringify([...state.kinds]));
+      state.hidden.has(k) ? state.hidden.delete(k) : state.hidden.add(k);
+      store.set("hiddenKinds", JSON.stringify([...state.hidden]));
       drawGraves();
       return render();
     }
-    if (t.dataset.act === "back") { state.selected = null; drawGraves(); return render(); }
-    if (t.dataset.act === "jump") {
+    const act = t.dataset.act;
+    if (act === "back") { state.selected = null; drawGraves(); return render(); }
+    if (act === "signin") return signIn();
+    if (act === "signout") return signOut();
+    if (act === "pause") { geni.paused = true; return render(); }
+    if (act === "resume") { geni.paused = false; geni.error = ""; return work(); }
+    if (act === "jump") {
       setMode("explore");
       setMe(move(state.section.centre, -18, 0), { pan: true, zoom: 19.5 });
     }
@@ -324,7 +580,7 @@
     t.textContent = msg;
     t.classList.add("show");
     clearTimeout(toast.timer);
-    toast.timer = setTimeout(() => t.classList.remove("show"), 3200);
+    toast.timer = setTimeout(() => t.classList.remove("show"), 3600);
   }
 
   function setMode(mode) {
@@ -332,7 +588,7 @@
     document.body.classList.toggle("live", mode === "live");
     $("#modeExplore").classList.toggle("on", mode === "explore");
     $("#modeLive").classList.toggle("on", mode === "live");
-    meMarker.dragging && (mode === "explore" ? meMarker.dragging.enable() : meMarker.dragging.disable());
+    if (meMarker.dragging) mode === "explore" ? meMarker.dragging.enable() : meMarker.dragging.disable();
     if (mode === "live") startLive();
     else stopLive();
   }
@@ -396,7 +652,6 @@
     render();
   });
   $("#units").textContent = state.units;
-  $("#section").addEventListener("click", (e) => e.stopPropagation());
 
   /* ---------- walking ---------- */
   const STEPS = { n: [1, 0, 0], s: [-1, 0, 180], e: [0, 1, 90], w: [0, -1, 270] };
@@ -411,8 +666,8 @@
   }
   const KEYS = { ArrowUp: "n", ArrowDown: "s", ArrowLeft: "w", ArrowRight: "e", w: "n", s: "s", a: "w", d: "e" };
   document.addEventListener("keydown", (e) => {
-    if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey) return;
-    const dir = KEYS[e.key] || KEYS[e.key.toLowerCase?.()];
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+    const dir = KEYS[e.key] || KEYS[e.key.toLowerCase()];
     if (!dir) return;
     e.preventDefault();
     step(dir, e.shiftKey ? 4 : 1);
