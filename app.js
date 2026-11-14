@@ -61,10 +61,23 @@
   }
   const radiusLabel = (r) => (state.units === "ft" ? `${Math.round(r * 3.28084 / 5) * 5} ft` : `${r} m`);
   const relOf = (g) => geni.rels[g.id];
+  // A blood line this close still counts as family, even when a shorter route runs through a marriage.
+  const BLOOD_COUSIN_LIMIT = 8;
+  const ORDINALS = ["first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+    "eleventh", "twelfth", "thirteenth", "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth", "nineteenth", "twentieth"];
+  function cousinDegree(text) {
+    const m = /(\w+)\s+cousin/i.exec(text || "");
+    if (!m) return 0; // uncle, niece, sibling…: closer than any cousin
+    const n = parseInt(m[1], 10);
+    return n || ORDINALS.indexOf(m[1].toLowerCase()) + 1 || 99;
+  }
+  // The blood line kept alongside an in-law answer, if it's close enough to count.
+  const closeBlood = (r) => (r?.kind === "inlaw" && r.also && r.also.kind !== "inlaw"
+    && cousinDegree(r.also.relationship) <= BLOOD_COUSIN_LIMIT) ? r.also : null;
   const kindOf = (g) => {
     const r = relOf(g);
     if (!r || r.status === "pending") return "unknown";
-    return r.kind;
+    return closeBlood(r) ? "blood" : r.kind;
   };
 
   /* ---------- Geni: sign-in ---------- */
@@ -101,7 +114,10 @@
     }
     try {
       const saved = JSON.parse(store.get("geniToken", "null"));
-      if (saved && saved.expires > Date.now()) Object.assign(geni, saved);
+      if (saved && saved.expires > Date.now()) {
+        Object.assign(geni, saved);
+        if (geni.user) loadRels();
+      }
     } catch { /* ignore */ }
     return geni.token ? "saved" : "none";
   }
@@ -257,9 +273,11 @@
         const u = await api("profile", { fields: "id,name" });
         if (!u.id) throw new Error("Geni didn't return your profile.");
         geni.user = { id: u.id, name: u.name || "you" };
-        loadRels();
+        // Remember who this is, so a reload shows saved answers at once instead of waiting on Geni.
+        store.set("geniToken", JSON.stringify({ token: geni.token, expires: geni.expires, user: geni.user }));
         if (kind === "new") toast(`Signed in as ${geni.user.name}.`);
       }
+      loadRels();
       drawGraves();
       work();
     } catch (e) {
@@ -533,11 +551,12 @@
 
   function row({ g, k, d, b }) {
     const yrs = [g.born, g.died].filter(Boolean).join("–");
-    const rel = relText(g);
+    const rel = relText(g), blood = closeBlood(relOf(g));
     return `<li class="row" tabindex="0" data-id="${esc(g.id)}">
       ${swatch(k)}
       <div><div class="nm">${esc(g.name)}</div>
         ${rel ? `<div class="rel ${relOf(g)?.status === "done" ? "" : "pending"}">${esc(rel)}</div>` : ""}
+        ${blood ? `<div class="rel">and your ${esc(blood.relationship)}</div>` : ""}
         ${yrs ? `<div class="yrs">${esc(yrs)}</div>` : ""}</div>
       <div class="dist">${arrowSvg(b)}${fmt(d)}<small>${compass(b)}</small></div></li>`;
   }
@@ -561,7 +580,8 @@
       relBlock = `<div class="signin small"><span class="muted">Sign in with Geni to see how you're related.</span>
         <button type="button" class="btn" data-act="signin" ${CONFIG.geniAppKey ? "" : "disabled"}>Sign in with Geni</button></div>`;
     } else if (r?.status === "done") {
-      relBlock = `<span class="tag" style="background:var(${KINDS[k].css})">${KINDS[k].label}</span>
+      const tags = closeBlood(r) ? ["blood", "inlaw"] : [k];
+      relBlock = `${tags.map((t) => `<span class="tag" style="background:var(${KINDS[t].css})">${KINDS[t].label}</span>`).join(" ")}
         <div class="big-rel">${r.relationship === "you" ? "This is you" : r.relationship ? `Your ${esc(r.relationship)}` : "Geni found no connection to you"}</div>`;
     } else {
       relBlock = `<div class="big-rel muted">${esc(relText(g))}</div>`;
@@ -580,7 +600,8 @@
         <span class="muted">· ${esc(KINDS[r.also.kind || "blood"].label.toLowerCase())}${r.also.steps ? `, ${r.also.steps} steps` : ""}</span></span></div>` : ""}
       ${steps ? `<h3>How you're connected · ${steps} step${steps > 1 ? "s" : ""}</h3>${chainHtml(r.chain, g)}` : ""}
       ${r?.also ? `<details class="also"><summary>Show the ${esc(KINDS[r.also.kind || "blood"].label.toLowerCase())} path</summary>${chainHtml(r.also.chain, g)}</details>` : ""}
-      ${steps && r?.also ? `<p class="muted note">Plotline shows the shorter connection first, and a blood line first unless it's more than two steps longer.</p>` : ""}
+      ${steps && r?.also ? `<p class="muted note">Plotline shows the shorter connection first, and a blood line first unless it's more than two steps longer.
+        Anyone who is your ${ORDINALS[BLOOD_COUSIN_LIMIT - 1]} cousin or closer by blood is coloured and counted as a blood relative.</p>` : ""}
       ${geni.user && r?.status === "done" ? `<button type="button" class="linkish recheck" data-act="recheck" data-gid="${esc(g.id)}">Ask Geni again</button>` : ""}
       <div class="links">
         <a class="btn" href="https://www.google.com/maps/dir/?api=1&destination=${g.gps[0]},${g.gps[1]}&travelmode=walking" target="_blank" rel="noopener">Walking directions</a>
